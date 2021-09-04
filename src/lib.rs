@@ -18,13 +18,13 @@
 //     all just super thin wrappers (e.g. easy to codegen).
 
 #![doc(html_root_url = "https://docs.rs/tar/0.4")]
-#![deny(missing_docs)]
+//#![deny(missing_docs)]
 #![cfg_attr(test, deny(warnings))]
 
 use std::io::{Error, ErrorKind};
 
 pub use crate::archive::{Archive, Entries};
-pub use crate::builder::Builder;
+pub use crate::builder::{Builder, FsEntry};
 pub use crate::entry::{Entry, Unpacked};
 pub use crate::entry_type::EntryType;
 pub use crate::header::GnuExtSparseHeader;

@@ -1,7 +1,7 @@
 use std::fs;
 use std::io;
 use std::io::prelude::*;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::str;
 
 use crate::header::{path2bytes, HeaderMode};
@@ -108,7 +108,8 @@ impl<W: Write> Builder<W> {
     /// let data = ar.into_inner().unwrap();
     /// ```
     pub fn append<R: Read>(&mut self, header: &Header, mut data: R) -> io::Result<()> {
-        append(self.get_mut(), header, &mut data)
+        write_header(header, self.get_mut())?;
+        write_content(&mut data, self.get_mut())
     }
 
     /// Adds a new entry to this archive with the specified path.
@@ -157,9 +158,9 @@ impl<W: Write> Builder<W> {
         path: P,
         data: R,
     ) -> io::Result<()> {
-        prepare_header_path(self.get_mut(), header, path.as_ref())?;
-        header.set_cksum();
-        self.append(&header, data)
+        write_header_longpath(path, header, self.get_mut())?;
+
+        self.append(header, data)
     }
 
     /// Adds a file on the local filesystem to this archive.
@@ -188,8 +189,8 @@ impl<W: Write> Builder<W> {
     /// ```
     pub fn append_path<P: AsRef<Path>>(&mut self, path: P) -> io::Result<()> {
         let mode = self.mode.clone();
-        let follow = self.follow;
-        append_path_with_name(self.get_mut(), path.as_ref(), None, mode, follow)
+
+        FsEntry::from_fs(path, self.follow)?.write(self.get_mut(), mode)
     }
 
     /// Adds a file on the local filesystem to this archive under another name.
@@ -226,14 +227,10 @@ impl<W: Write> Builder<W> {
         name: N,
     ) -> io::Result<()> {
         let mode = self.mode.clone();
-        let follow = self.follow;
-        append_path_with_name(
-            self.get_mut(),
-            path.as_ref(),
-            Some(name.as_ref()),
-            mode,
-            follow,
-        )
+
+        FsEntry::from_fs(path, self.follow)?
+            .set_path(name.as_ref().to_owned())
+            .write(self.get_mut(), mode)
     }
 
     /// Adds a file to this archive with the given path as the name of the file
@@ -264,7 +261,16 @@ impl<W: Write> Builder<W> {
     /// ```
     pub fn append_file<P: AsRef<Path>>(&mut self, path: P, file: &mut fs::File) -> io::Result<()> {
         let mode = self.mode.clone();
-        append_file(self.get_mut(), path.as_ref(), file, mode)
+
+        FsEntry {
+            stat: file.metadata()?,
+            // This path is only used in error messages and to read link-content, so
+            // using the archive-path here has no impact
+            fs_path: path.as_ref().to_owned(),
+            path: path.as_ref().to_owned(),
+            content: Some(file),
+        }
+        .write(self.get_mut(), mode)
     }
 
     /// Adds a directory to this archive with the given path as the name of the
@@ -301,7 +307,10 @@ impl<W: Write> Builder<W> {
         Q: AsRef<Path>,
     {
         let mode = self.mode.clone();
-        append_dir(self.get_mut(), path.as_ref(), src_path.as_ref(), mode)
+
+        FsEntry::from_fs(src_path, self.follow)?
+            .set_path(path.as_ref().to_owned())
+            .write(self.get_mut(), mode)
     }
 
     /// Adds a directory and all of its contents (recursively) to this archive
@@ -358,9 +367,211 @@ impl<W: Write> Builder<W> {
     }
 }
 
-fn append(mut dst: &mut dyn Write, header: &Header, mut data: &mut dyn Read) -> io::Result<()> {
-    dst.write_all(header.as_bytes())?;
-    let len = io::copy(&mut data, &mut dst)?;
+pub struct FsEntry<R> {
+    stat: fs::Metadata,
+    content: Option<R>,
+    path: PathBuf,
+    fs_path: PathBuf,
+}
+
+impl FsEntry<fs::File> {
+    pub fn from_fs(path: impl AsRef<Path>, follow_symlinks: bool) -> io::Result<FsEntry<fs::File>> {
+        let stat = if follow_symlinks {
+            fs::metadata(&path).map_err(|err| {
+                io::Error::new(
+                    err.kind(),
+                    format!(
+                        "{} when getting metadata for {}",
+                        err,
+                        path.as_ref().display()
+                    ),
+                )
+            })?
+        } else {
+            fs::symlink_metadata(&path).map_err(|err| {
+                io::Error::new(
+                    err.kind(),
+                    format!(
+                        "{} when getting metadata for {}",
+                        err,
+                        path.as_ref().display()
+                    ),
+                )
+            })?
+        };
+
+        Ok(FsEntry {
+            content: if stat.is_file() {
+                Some(fs::File::open(&path)?)
+            } else {
+                None
+            },
+            path: path.as_ref().to_owned(),
+            fs_path: path.as_ref().to_owned(),
+            stat,
+        })
+    }
+}
+
+impl<R> FsEntry<R> {
+    pub fn set_path(self, path: PathBuf) -> Self {
+        FsEntry { path, ..self }
+    }
+
+    pub fn set_stat(self, stat: fs::Metadata) -> Self {
+        FsEntry { stat, ..self }
+    }
+
+    pub fn set_content<Content: Read>(self, content: Content) -> FsEntry<Content> {
+        FsEntry {
+            content: Some(content),
+            path: self.path,
+            fs_path: self.fs_path,
+            stat: self.stat,
+        }
+    }
+}
+
+impl<R: Read> FsEntry<R> {
+    fn write_link_header(&self, mut header: Header, dst: &mut impl Write) -> io::Result<()> {
+        let link_name = fs::read_link(&self.fs_path)?;
+
+        if let Err(e) = header.set_link_name(&link_name) {
+            let data = path2bytes(&link_name)?;
+
+            // Since `e` isn't specific enough to let us know the path is indeed too
+            // long, verify it first before using the extension.
+            if data.len() < header.as_old().linkname.len() {
+                return Err(e);
+            }
+
+            write_header(
+                &mut prepare_longlink_header(data.len() as u64, EntryType::GNULongLink.as_byte()),
+                dst,
+            )?;
+            // write null-terminated string
+            write_content(&mut data.chain(io::repeat(0).take(1)), dst)?;
+        }
+
+        header.set_cksum();
+
+        write_header(&mut header, dst)
+    }
+
+    #[cfg(unix)]
+    fn write_special_header(&self, mut header: Header, dst: &mut impl Write) -> io::Result<()> {
+        use ::std::os::unix::fs::{FileTypeExt, MetadataExt};
+
+        let file_type = self.stat.file_type();
+
+        if file_type.is_fifo() {
+            header.set_entry_type(EntryType::Fifo);
+        } else if file_type.is_char_device() {
+            header.set_entry_type(EntryType::Char);
+        } else if file_type.is_block_device() {
+            header.set_entry_type(EntryType::Block);
+        } else if file_type.is_socket() {
+            return Err(other(&format!(
+                "{}: socket can not be archived",
+                self.fs_path.display()
+            )));
+        } else {
+            return Err(other(&format!(
+                "{} has unknown file type",
+                self.fs_path.display()
+            )));
+        }
+
+        let dev_id = self.stat.rdev();
+        let dev_major = ((dev_id >> 32) & 0xffff_f000) | ((dev_id >> 8) & 0x0000_0fff);
+        let dev_minor = ((dev_id >> 12) & 0xffff_ff00) | ((dev_id) & 0x0000_00ff);
+        header.set_device_major(dev_major as u32)?;
+        header.set_device_minor(dev_minor as u32)?;
+        header.set_cksum();
+
+        write_header(&mut header, dst)
+    }
+
+    pub fn write(self, dst: &mut impl Write, mode: HeaderMode) -> io::Result<()> {
+        let mut header = Header::new_gnu();
+        header.set_metadata_in_mode(&self.stat, mode);
+        header.set_cksum();
+
+        write_header_longpath(&self.path, &mut header, dst)?;
+
+        if self.stat.is_file() || self.stat.is_dir() {
+            write_header(&mut header, dst)?;
+        } else if self.stat.file_type().is_symlink() {
+            self.write_link_header(header, dst)?;
+        } else {
+            #[cfg(unix)]
+            {
+                self.write_special_header(header, dst)?;
+            }
+            #[cfg(not(unix))]
+            {
+                Err(other(&format!("{} has unknown file type", path.display())))
+            }
+        }
+
+        if let Some(mut reader) = self.content {
+            write_content(&mut reader, dst)?;
+        }
+
+        Ok(())
+    }
+}
+
+fn write_header_longpath(
+    path: impl AsRef<Path>,
+    header: &mut Header,
+    dst: &mut impl Write,
+) -> io::Result<()> {
+    // Try to encode the path directly in the header, but if it ends up not
+    // working (probably because it's too long) then try to use the GNU-specific
+    // long name extension by emitting an entry which indicates that it's the
+    // filename.
+    if let Err(e) = header.set_path(&path) {
+        let data = path2bytes(path.as_ref())?;
+        let max = header.as_old().name.len();
+
+        // Since `e` isn't specific enough to let us know the path is indeed too
+        // long, verify it first before using the extension.
+        if data.len() < max {
+            return Err(e);
+        }
+
+        write_header(
+            &mut prepare_longlink_header(data.len() as u64, EntryType::GNULongName.as_byte()),
+            dst,
+        )?;
+        // write null-terminated string
+        write_content(&mut data.chain(io::repeat(0).take(1)), dst)?;
+
+        // Truncate the path to store in the header we're about to emit to
+        // ensure we've got something at least mentioned. Note that we use
+        // `str`-encoding to be compatible with Windows, but in general the
+        // entry in the header itself shouldn't matter too much since extraction
+        // doesn't look at it.
+        let truncated = match str::from_utf8(&data[..max]) {
+            Ok(s) => s,
+            Err(e) => str::from_utf8(&data[..e.valid_up_to()]).unwrap(),
+        };
+
+        header.set_path(truncated)?;
+    }
+
+    header.set_cksum();
+
+    Ok(())
+}
+
+fn write_header(header: &Header, dst: &mut impl Write) -> io::Result<()> {
+    dst.write_all(header.as_bytes())
+}
+
+fn write_content(src: &mut impl Read, dst: &mut impl Write) -> io::Result<()> {
+    let len = io::copy(src, dst)?;
 
     // Pad with zeros if necessary.
     let buf = [0; 512];
@@ -372,120 +583,7 @@ fn append(mut dst: &mut dyn Write, header: &Header, mut data: &mut dyn Read) -> 
     Ok(())
 }
 
-fn append_path_with_name(
-    dst: &mut dyn Write,
-    path: &Path,
-    name: Option<&Path>,
-    mode: HeaderMode,
-    follow: bool,
-) -> io::Result<()> {
-    let stat = if follow {
-        fs::metadata(path).map_err(|err| {
-            io::Error::new(
-                err.kind(),
-                format!("{} when getting metadata for {}", err, path.display()),
-            )
-        })?
-    } else {
-        fs::symlink_metadata(path).map_err(|err| {
-            io::Error::new(
-                err.kind(),
-                format!("{} when getting metadata for {}", err, path.display()),
-            )
-        })?
-    };
-    let ar_name = name.unwrap_or(path);
-    if stat.is_file() {
-        append_fs(dst, ar_name, &stat, &mut fs::File::open(path)?, mode, None)
-    } else if stat.is_dir() {
-        append_fs(dst, ar_name, &stat, &mut io::empty(), mode, None)
-    } else if stat.file_type().is_symlink() {
-        let link_name = fs::read_link(path)?;
-        append_fs(
-            dst,
-            ar_name,
-            &stat,
-            &mut io::empty(),
-            mode,
-            Some(&link_name),
-        )
-    } else {
-        #[cfg(unix)]
-        {
-            append_special(dst, path, &stat, mode)
-        }
-        #[cfg(not(unix))]
-        {
-            Err(other(&format!("{} has unknown file type", path.display())))
-        }
-    }
-}
-
-#[cfg(unix)]
-fn append_special(
-    dst: &mut dyn Write,
-    path: &Path,
-    stat: &fs::Metadata,
-    mode: HeaderMode,
-) -> io::Result<()> {
-    use ::std::os::unix::fs::{FileTypeExt, MetadataExt};
-
-    let file_type = stat.file_type();
-    let entry_type;
-    if file_type.is_socket() {
-        // sockets can't be archived
-        return Err(other(&format!(
-            "{}: socket can not be archived",
-            path.display()
-        )));
-    } else if file_type.is_fifo() {
-        entry_type = EntryType::Fifo;
-    } else if file_type.is_char_device() {
-        entry_type = EntryType::Char;
-    } else if file_type.is_block_device() {
-        entry_type = EntryType::Block;
-    } else {
-        return Err(other(&format!("{} has unknown file type", path.display())));
-    }
-
-    let mut header = Header::new_gnu();
-    header.set_metadata_in_mode(stat, mode);
-    prepare_header_path(dst, &mut header, path)?;
-
-    header.set_entry_type(entry_type);
-    let dev_id = stat.rdev();
-    let dev_major = ((dev_id >> 32) & 0xffff_f000) | ((dev_id >> 8) & 0x0000_0fff);
-    let dev_minor = ((dev_id >> 12) & 0xffff_ff00) | ((dev_id) & 0x0000_00ff);
-    header.set_device_major(dev_major as u32)?;
-    header.set_device_minor(dev_minor as u32)?;
-
-    header.set_cksum();
-    dst.write_all(header.as_bytes())?;
-
-    Ok(())
-}
-
-fn append_file(
-    dst: &mut dyn Write,
-    path: &Path,
-    file: &mut fs::File,
-    mode: HeaderMode,
-) -> io::Result<()> {
-    let stat = file.metadata()?;
-    append_fs(dst, path, &stat, file, mode, None)
-}
-
-fn append_dir(
-    dst: &mut dyn Write,
-    path: &Path,
-    src_path: &Path,
-    mode: HeaderMode,
-) -> io::Result<()> {
-    let stat = fs::metadata(src_path)?;
-    append_fs(dst, path, &stat, &mut io::empty(), mode, None)
-}
-
-fn prepare_header(size: u64, entry_type: u8) -> Header {
+fn prepare_longlink_header(size: u64, entry_type: u8) -> Header {
     let mut header = Header::new_gnu();
     let name = b"././@LongLink";
     header.as_gnu_mut().unwrap().name[..name.len()].clone_from_slice(&name[..]);
@@ -500,77 +598,8 @@ fn prepare_header(size: u64, entry_type: u8) -> Header {
     header
 }
 
-fn prepare_header_path(dst: &mut dyn Write, header: &mut Header, path: &Path) -> io::Result<()> {
-    // Try to encode the path directly in the header, but if it ends up not
-    // working (probably because it's too long) then try to use the GNU-specific
-    // long name extension by emitting an entry which indicates that it's the
-    // filename.
-    if let Err(e) = header.set_path(path) {
-        let data = path2bytes(&path)?;
-        let max = header.as_old().name.len();
-        // Since `e` isn't specific enough to let us know the path is indeed too
-        // long, verify it first before using the extension.
-        if data.len() < max {
-            return Err(e);
-        }
-        let header2 = prepare_header(data.len() as u64, b'L');
-        // null-terminated string
-        let mut data2 = data.chain(io::repeat(0).take(1));
-        append(dst, &header2, &mut data2)?;
-
-        // Truncate the path to store in the header we're about to emit to
-        // ensure we've got something at least mentioned. Note that we use
-        // `str`-encoding to be compatible with Windows, but in general the
-        // entry in the header itself shouldn't matter too much since extraction
-        // doesn't look at it.
-        let truncated = match str::from_utf8(&data[..max]) {
-            Ok(s) => s,
-            Err(e) => str::from_utf8(&data[..e.valid_up_to()]).unwrap(),
-        };
-        header.set_path(truncated)?;
-    }
-    Ok(())
-}
-
-fn prepare_header_link(
-    dst: &mut dyn Write,
-    header: &mut Header,
-    link_name: &Path,
-) -> io::Result<()> {
-    // Same as previous function but for linkname
-    if let Err(e) = header.set_link_name(&link_name) {
-        let data = path2bytes(&link_name)?;
-        if data.len() < header.as_old().linkname.len() {
-            return Err(e);
-        }
-        let header2 = prepare_header(data.len() as u64, b'K');
-        let mut data2 = data.chain(io::repeat(0).take(1));
-        append(dst, &header2, &mut data2)?;
-    }
-    Ok(())
-}
-
-fn append_fs(
-    dst: &mut dyn Write,
-    path: &Path,
-    meta: &fs::Metadata,
-    read: &mut dyn Read,
-    mode: HeaderMode,
-    link_name: Option<&Path>,
-) -> io::Result<()> {
-    let mut header = Header::new_gnu();
-
-    prepare_header_path(dst, &mut header, path)?;
-    header.set_metadata_in_mode(meta, mode);
-    if let Some(link_name) = link_name {
-        prepare_header_link(dst, &mut header, link_name)?;
-    }
-    header.set_cksum();
-    append(dst, &header, read)
-}
-
 fn append_dir_all(
-    dst: &mut dyn Write,
+    dst: &mut impl Write,
     path: &Path,
     src_path: &Path,
     mode: HeaderMode,
@@ -578,7 +607,6 @@ fn append_dir_all(
 ) -> io::Result<()> {
     let mut stack = vec![(src_path.to_path_buf(), true, false)];
     while let Some((src, is_dir, is_symlink)) = stack.pop() {
-        let dest = path.join(src.strip_prefix(&src_path).unwrap());
         // In case of a symlink pointing to a directory, is_dir is false, but src.is_dir() will return true
         if is_dir || (is_symlink && follow && src.is_dir()) {
             for entry in fs::read_dir(&src)? {
@@ -586,25 +614,16 @@ fn append_dir_all(
                 let file_type = entry.file_type()?;
                 stack.push((entry.path(), file_type.is_dir(), file_type.is_symlink()));
             }
-            if dest != Path::new("") {
-                append_dir(dst, &dest, &src, mode)?;
-            }
-        } else if !follow && is_symlink {
-            let stat = fs::symlink_metadata(&src)?;
-            let link_name = fs::read_link(&src)?;
-            append_fs(dst, &dest, &stat, &mut io::empty(), mode, Some(&link_name))?;
-        } else {
-            #[cfg(unix)]
-            {
-                let stat = fs::metadata(&src)?;
-                if !stat.is_file() {
-                    append_special(dst, &dest, &stat, mode)?;
-                    continue;
-                }
-            }
-            append_file(dst, &dest, &mut fs::File::open(src)?, mode)?;
+        }
+
+        let dest = path.join(src.strip_prefix(&src_path).unwrap());
+        if dest != Path::new("") {
+            FsEntry::from_fs(src, follow)?
+                .set_path(dest)
+                .write(dst, mode)?;
         }
     }
+
     Ok(())
 }
 
