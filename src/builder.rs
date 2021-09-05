@@ -75,55 +75,6 @@ impl<W: Write> Builder<W> {
         entry.write(self)
     }
 
-    /// Adds a directory and all of its contents (recursively) to this archive
-    /// with the given path as the name of the directory in the archive.
-    ///
-    /// Note that this will not attempt to seek the archive to a valid position,
-    /// so if the archive is in the middle of a read or some other similar
-    /// operation then this may corrupt the archive.
-    ///
-    /// Also note that after all files have been written to an archive the
-    /// `finish` function needs to be called to finish writing the archive.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use std::fs;
-    /// use tar::Builder;
-    ///
-    /// let mut ar = Builder::new(Vec::new());
-    ///
-    /// // Use the directory at one location, but insert it into the archive
-    /// // with a different name.
-    /// ar.append_dir_all("bardir", ".").unwrap();
-    /// ```
-    pub fn append_dir_all<P, Q>(&mut self, path: P, src_path: Q) -> io::Result<()>
-    where
-        P: AsRef<Path>,
-        Q: AsRef<Path>,
-    {
-        let mut stack = vec![(src_path.as_ref().to_owned(), true, false)];
-        while let Some((src, is_dir, is_symlink)) = stack.pop() {
-            // In case of a symlink pointing to a directory, is_dir is false, but src.is_dir() will return true
-            if is_dir || (is_symlink && self.follow && src.is_dir()) {
-                for entry in fs::read_dir(&src)? {
-                    let entry = entry?;
-                    let file_type = entry.file_type()?;
-                    stack.push((entry.path(), file_type.is_dir(), file_type.is_symlink()));
-                }
-            }
-
-            let dest = path.as_ref().join(src.strip_prefix(&src_path).unwrap());
-            if dest != Path::new("") {
-                FsEntry::from_fs(src, self.follow)?
-                    .set_path(dest)
-                    .write(self)?;
-            }
-        }
-
-        Ok(())
-    }
-
     pub fn append_header(&mut self, header: &Header) -> io::Result<()> {
         self.get_mut().write_all(header.as_bytes())
     }
@@ -220,6 +171,14 @@ pub struct FileEntry<R> {
 impl<R> FileEntry<R> {
     pub fn set_path(self, path: PathBuf) -> Self {
         FileEntry { path, ..self }
+    }
+
+    pub fn set_content<R2: io::Read>(self, content: R2) -> FileEntry<R2> {
+        FileEntry {
+            content,
+            header: self.header,
+            path: self.path,
+        }
     }
 }
 
@@ -384,6 +343,22 @@ pub enum FsEntry<R> {
 }
 
 impl<R> FsEntry<R> {
+    pub fn path(&self) -> &Path {
+        match self {
+            Self::Dir(entry) => &entry.path,
+            Self::File(entry) => &entry.path,
+            Self::Link(entry) => &entry.path,
+            #[cfg(unix)]
+            Self::Special(entry) => &entry.path,
+        }
+    }
+
+    pub fn prefix(self, path: impl AsRef<Path>) -> Self {
+        let path = path.as_ref().join(self.path());
+
+        self.set_path(path)
+    }
+
     pub fn set_path(self, path: PathBuf) -> Self {
         match self {
             Self::Dir(entry) => Self::Dir(entry.set_path(path)),
@@ -441,5 +416,67 @@ impl<R: io::Read> WritableEntry for FsEntry<R> {
             #[cfg(unix)]
             Self::Special(entry) => entry.write(builder),
         }
+    }
+}
+
+pub struct DirWalker {
+    root: PathBuf,
+    stack: Vec<(PathBuf, bool, bool)>,
+    follow_symlinks: bool,
+}
+
+impl DirWalker {
+    pub fn new(root: PathBuf, follow_symlinks: bool) -> Self {
+        DirWalker {
+            stack: vec![(root.clone(), true, false)],
+            root,
+            follow_symlinks,
+        }
+    }
+
+    fn extend_from_directory(&mut self, pth: &Path) -> io::Result<()> {
+        for entry in fs::read_dir(&pth)? {
+            let entry = entry?;
+            let file_type = entry.file_type()?;
+            self.stack
+                .push((entry.path(), file_type.is_dir(), file_type.is_symlink()));
+        }
+
+        Ok(())
+    }
+
+    fn stack_entry_to_fs_entry(
+        &mut self,
+        (src, is_dir, is_symlink): (PathBuf, bool, bool),
+    ) -> io::Result<Option<FsEntry<fs::File>>> {
+        // In case of a symlink pointing to a directory, is_dir is false, but src.is_dir() will return true
+        if is_dir || (is_symlink && self.follow_symlinks && src.is_dir()) {
+            self.extend_from_directory(&src)?;
+        }
+
+        let dest = src.strip_prefix(&self.root).unwrap().to_owned();
+        if dest == Path::new("") {
+            return Ok(None);
+        }
+
+        Ok(Some(
+            FsEntry::from_fs(src, self.follow_symlinks)?.set_path(dest),
+        ))
+    }
+}
+
+impl Iterator for DirWalker {
+    type Item = io::Result<FsEntry<fs::File>>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while let Some(entry) = self.stack.pop() {
+            match self.stack_entry_to_fs_entry(entry) {
+                Err(err) => return Some(Err(err)),
+                Ok(Some(fs_entry)) => return Some(Ok(fs_entry)),
+                Ok(None) => continue,
+            }
+        }
+
+        return None;
     }
 }

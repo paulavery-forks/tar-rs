@@ -24,7 +24,9 @@
 use std::io::{Error, ErrorKind};
 
 pub use crate::archive::{Archive, Entries};
-pub use crate::builder::{Builder, FsEntry};
+pub use crate::builder::{
+    Builder, DirEntry, DirWalker, FileEntry, FsEntry, LinkEntry, SpecialEntry, WritableEntry,
+};
 pub use crate::entry::{Entry, Unpacked};
 pub use crate::entry_type::EntryType;
 pub use crate::header::GnuExtSparseHeader;

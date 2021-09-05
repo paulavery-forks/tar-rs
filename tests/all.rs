@@ -11,7 +11,7 @@ use std::iter::repeat;
 use std::path::{Path, PathBuf};
 
 use filetime::FileTime;
-use tar::{Archive, Builder, EntryType, FsEntry, Header};
+use tar::{Archive, Builder, DirWalker, EntryType, FsEntry, Header};
 use tempfile::{Builder as TempBuilder, TempDir};
 
 macro_rules! t {
@@ -379,7 +379,9 @@ fn writing_directories_recursively() {
     t!(t!(File::create(sub_dir.join("file2"))).write_all(b"file2"));
 
     let mut ar = Builder::new(Vec::new());
-    t!(ar.append_dir_all("foobar", base_dir));
+    for file in DirWalker::new(base_dir, true) {
+        t!(ar.append(t!(file).prefix("foobar")))
+    }
     let data = t!(ar.into_inner());
 
     let mut ar = Archive::new(Cursor::new(data));
@@ -410,7 +412,9 @@ fn append_dir_all_blank_dest() {
     t!(t!(File::create(sub_dir.join("file2"))).write_all(b"file2"));
 
     let mut ar = Builder::new(Vec::new());
-    t!(ar.append_dir_all("", base_dir));
+    for file in DirWalker::new(base_dir, true) {
+        t!(ar.append(t!(file)))
+    }
     let data = t!(ar.into_inner());
 
     let mut ar = Archive::new(Cursor::new(data));
@@ -436,7 +440,12 @@ fn append_dir_all_does_not_work_on_non_directory() {
     t!(t!(File::create(&path)).write_all(b"test"));
 
     let mut ar = Builder::new(Vec::new());
-    let result = ar.append_dir_all("test", path);
+    let result = (|| -> io::Result<()> {
+        for file in DirWalker::new(path, true) {
+            ar.append(file?.prefix("test"))?;
+        }
+        Ok(())
+    })();
     assert!(result.is_err());
 }
 
@@ -1152,7 +1161,9 @@ fn tar_directory_containing_symlink_to_directory() {
 
     assert!(dummy_dst.read_link().is_ok());
     assert!(dummy_dst.read_link().unwrap().is_dir());
-    ar.append_dir_all("symlinks", td.path()).unwrap();
+    for file in DirWalker::new(td.path().to_owned(), true) {
+        t!(ar.append(t!(file).prefix("symlinks")))
+    }
     ar.finish().unwrap();
 }
 
@@ -1246,11 +1257,13 @@ fn tar_directory_containing_special_files() {
     let mut ar = Builder::new(Vec::new());
     // append_path has a different logic for processing files, so we need to test it as well
     t!(ar.append(t!(FsEntry::from_fs("fifo".into(), false))));
-    t!(ar.append_dir_all("special", td.path()));
+    for file in DirWalker::new(td.path().to_owned(), true) {
+        t!(ar.append(t!(file).prefix("special")))
+    }
     // unfortunately, block device file cannot be created by non-root users
     // as a substitute, just test the file that exists on most Unix systems
     t!(env::set_current_dir("/dev/"));
-    t!(ar.append(t!(FsEntry::from_fs("loop0".into(), false))));
+    t!(ar.append(t!(FsEntry::from_fs("full".into(), false))));
     // CI systems seem to have issues with creating a chr device
     t!(ar.append(t!(FsEntry::from_fs("null".into(), false))));
     t!(ar.finish());
