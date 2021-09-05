@@ -23,20 +23,6 @@ pub struct Header {
     bytes: [u8; 512],
 }
 
-/// Declares the information that should be included when filling a Header
-/// from filesystem metadata.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-#[non_exhaustive]
-pub enum HeaderMode {
-    /// All supported metadata, including mod/access times and ownership will
-    /// be included.
-    Complete,
-
-    /// Only metadata that is directly relevant to the identity of a file will
-    /// be included. In particular, ownership and mod/access times are excluded.
-    Deterministic,
-}
-
 /// Representation of the header of an entry in an archive
 #[repr(C)]
 #[allow(missing_docs)]
@@ -277,16 +263,9 @@ impl Header {
     /// provided.
     ///
     /// This is useful for initializing a `Header` from the OS's metadata from a
-    /// file. By default, this will use `HeaderMode::Complete` to include all
-    /// metadata.
+    /// file.
     pub fn set_metadata(&mut self, meta: &fs::Metadata) {
-        self.fill_from(meta, HeaderMode::Complete);
-    }
-
-    /// Sets only the metadata relevant to the given HeaderMode in this header
-    /// from the metadata argument provided.
-    pub fn set_metadata_in_mode(&mut self, meta: &fs::Metadata, mode: HeaderMode) {
-        self.fill_from(meta, mode);
+        self.fill_from(meta);
     }
 
     /// Returns the size of entry's data this header represents.
@@ -700,8 +679,8 @@ impl Header {
             .fold(0, |a, b| a + (*b as u32))
     }
 
-    fn fill_from(&mut self, meta: &fs::Metadata, mode: HeaderMode) {
-        self.fill_platform_from(meta, mode);
+    fn fill_from(&mut self, meta: &fs::Metadata) {
+        self.fill_platform_from(meta);
         // Set size of directories to zero
         self.set_size(if meta.is_dir() || meta.file_type().is_symlink() {
             0
@@ -720,43 +699,16 @@ impl Header {
 
     #[cfg(target_arch = "wasm32")]
     #[allow(unused_variables)]
-    fn fill_platform_from(&mut self, meta: &fs::Metadata, mode: HeaderMode) {
+    fn fill_platform_from(&mut self, meta: &fs::Metadata) {
         unimplemented!();
     }
 
     #[cfg(unix)]
-    fn fill_platform_from(&mut self, meta: &fs::Metadata, mode: HeaderMode) {
-        match mode {
-            HeaderMode::Complete => {
-                self.set_mtime(meta.mtime() as u64);
-                self.set_uid(meta.uid() as u64);
-                self.set_gid(meta.gid() as u64);
-                self.set_mode(meta.mode() as u32);
-            }
-            HeaderMode::Deterministic => {
-                // We could in theory set the mtime to zero here, but not all
-                // tools seem to behave well when ingesting files with a 0
-                // timestamp. For example rust-lang/cargo#9512 shows that lldb
-                // doesn't ingest files with a zero timestamp correctly.
-                //
-                // We just need things to be deterministic here so just pick
-                // something that isn't zero. This time, chosen after careful
-                // deliberation, corresponds to Jul 23, 2006 -- the date of the
-                // first commit for what would become Rust.
-                self.set_mtime(1153704088);
-
-                self.set_uid(0);
-                self.set_gid(0);
-
-                // Use a default umask value, but propagate the (user) execute bit.
-                let fs_mode = if meta.is_dir() || (0o100 & meta.mode() == 0o100) {
-                    0o755
-                } else {
-                    0o644
-                };
-                self.set_mode(fs_mode);
-            }
-        }
+    fn fill_platform_from(&mut self, meta: &fs::Metadata) {
+        self.set_mtime(meta.mtime() as u64);
+        self.set_uid(meta.uid() as u64);
+        self.set_gid(meta.gid() as u64);
+        self.set_mode(meta.mode() as u32);
 
         // Note that if we are a GNU header we *could* set atime/ctime, except
         // the `tar` utility doesn't do that by default and it causes problems
@@ -784,38 +736,28 @@ impl Header {
     }
 
     #[cfg(windows)]
-    fn fill_platform_from(&mut self, meta: &fs::Metadata, mode: HeaderMode) {
+    fn fill_platform_from(&mut self, meta: &fs::Metadata) {
+        self.set_uid(0);
+        self.set_gid(0);
+        // The dates listed in tarballs are always seconds relative to
+        // January 1, 1970. On Windows, however, the timestamps are returned as
+        // dates relative to January 1, 1601 (in 100ns intervals), so we need to
+        // add in some offset for those dates.
+        let mtime = (meta.last_write_time() / (1_000_000_000 / 100)) - 11644473600;
+        self.set_mtime(mtime);
+
         // There's no concept of a file mode on Windows, so do a best approximation here.
-        match mode {
-            HeaderMode::Complete => {
-                self.set_uid(0);
-                self.set_gid(0);
-                // The dates listed in tarballs are always seconds relative to
-                // January 1, 1970. On Windows, however, the timestamps are returned as
-                // dates relative to January 1, 1601 (in 100ns intervals), so we need to
-                // add in some offset for those dates.
-                let mtime = (meta.last_write_time() / (1_000_000_000 / 100)) - 11644473600;
-                self.set_mtime(mtime);
-                let fs_mode = {
-                    const FILE_ATTRIBUTE_READONLY: u32 = 0x00000001;
-                    let readonly = meta.file_attributes() & FILE_ATTRIBUTE_READONLY;
-                    match (meta.is_dir(), readonly != 0) {
-                        (true, false) => 0o755,
-                        (true, true) => 0o555,
-                        (false, false) => 0o644,
-                        (false, true) => 0o444,
-                    }
-                };
-                self.set_mode(fs_mode);
+        let fs_mode = {
+            const FILE_ATTRIBUTE_READONLY: u32 = 0x00000001;
+            let readonly = meta.file_attributes() & FILE_ATTRIBUTE_READONLY;
+            match (meta.is_dir(), readonly != 0) {
+                (true, false) => 0o755,
+                (true, true) => 0o555,
+                (false, false) => 0o644,
+                (false, true) => 0o444,
             }
-            HeaderMode::Deterministic => {
-                self.set_uid(0);
-                self.set_gid(0);
-                self.set_mtime(123456789); // see above in unix
-                let fs_mode = if meta.is_dir() { 0o755 } else { 0o644 };
-                self.set_mode(fs_mode);
-            }
-        }
+        };
+        self.set_mode(fs_mode);
 
         let ft = meta.file_type();
         self.set_entry_type(if ft.is_dir() {

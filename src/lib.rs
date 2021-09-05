@@ -28,7 +28,7 @@ pub use crate::builder::{Builder, FsEntry};
 pub use crate::entry::{Entry, Unpacked};
 pub use crate::entry_type::EntryType;
 pub use crate::header::GnuExtSparseHeader;
-pub use crate::header::{GnuHeader, GnuSparseHeader, Header, HeaderMode, OldHeader, UstarHeader};
+pub use crate::header::{GnuHeader, GnuSparseHeader, Header, OldHeader, UstarHeader};
 pub use crate::pax::{PaxExtension, PaxExtensions};
 
 mod archive;

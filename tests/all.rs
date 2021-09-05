@@ -11,7 +11,7 @@ use std::iter::repeat;
 use std::path::{Path, PathBuf};
 
 use filetime::FileTime;
-use tar::{Archive, Builder, EntryType, Header, HeaderMode};
+use tar::{Archive, Builder, EntryType, FsEntry, Header};
 use tempfile::{Builder as TempBuilder, TempDir};
 
 macro_rules! t {
@@ -137,7 +137,7 @@ fn writing_files() {
     let path = td.path().join("test");
     t!(t!(File::create(&path)).write_all(b"test"));
 
-    t!(ar.append_file("test2", &mut t!(File::open(&path))));
+    t!(ar.append(t!(FsEntry::from_fs(path, false)).set_path("test2".into())));
 
     let data = t!(ar.into_inner());
     let mut ar = Archive::new(Cursor::new(data));
@@ -166,10 +166,14 @@ fn large_filename() {
     header.set_path(&filename).unwrap();
     header.set_metadata(&t!(fs::metadata(&path)));
     header.set_cksum();
-    t!(ar.append(&header, &b"test"[..]));
+    t!(ar.append_header(&header));
+    t!(ar.append_content(&b"test"[..]));
     let too_long = repeat("abcd").take(200).collect::<String>();
-    t!(ar.append_file(&too_long, &mut t!(File::open(&path))));
-    t!(ar.append_data(&mut header, &too_long, &b"test"[..]));
+    t!(ar.append(t!(FsEntry::from_fs(path, false)).set_path(too_long.clone().into())));
+
+    t!(ar.append_longpath(&too_long, &mut header));
+    t!(ar.append_header(&header));
+    t!(ar.append_content(&b"test"[..]));
 
     let rd = Cursor::new(t!(ar.into_inner()));
     let mut ar = Archive::new(rd);
@@ -352,9 +356,9 @@ fn writing_and_extracting_directories() {
     let mut ar = Builder::new(Vec::new());
     let tmppath = td.path().join("tmpfile");
     t!(t!(File::create(&tmppath)).write_all(b"c"));
-    t!(ar.append_dir("a", "."));
-    t!(ar.append_dir("a/b", "."));
-    t!(ar.append_file("a/c", &mut t!(File::open(&tmppath))));
+    t!(ar.append(t!(FsEntry::from_fs(".".into(), false)).set_path("a".into())));
+    t!(ar.append(t!(FsEntry::from_fs(".".into(), false)).set_path("a/b".into())));
+    t!(ar.append(t!(FsEntry::from_fs(tmppath, false)).set_path("a/c".into())));
     t!(ar.finish());
 
     let rdr = Cursor::new(t!(ar.into_inner()));
@@ -458,7 +462,7 @@ fn unpack_old_style_bsd_dir() {
     t!(header.set_path("testdir/"));
     header.set_size(0);
     header.set_cksum();
-    t!(ar.append(&header, &mut io::empty()));
+    t!(ar.append_header(&header));
 
     // Extracting
     let rdr = Cursor::new(t!(ar.into_inner()));
@@ -487,7 +491,8 @@ fn handling_incorrect_file_size() {
     header.set_metadata(&t!(file.metadata()));
     header.set_size(2048); // past the end of file null blocks
     header.set_cksum();
-    t!(ar.append(&header, &mut file));
+    t!(ar.append_header(&header));
+    t!(ar.append_content(&mut file));
 
     // Extracting
     let rdr = Cursor::new(t!(ar.into_inner()));
@@ -519,7 +524,8 @@ fn extracting_malicious_tarball() {
             }
             header.set_size(1);
             header.set_cksum();
-            t!(a.append(&header, io::repeat(1).take(1)));
+            t!(a.append_header(&header));
+            t!(a.append_content(&mut io::repeat(1).take(1)));
         };
         append("/tmp/abs_evil.txt");
         append("//tmp/abs_evil2.txt");
@@ -608,12 +614,12 @@ fn extracting_malformed_tar_null_blocks() {
     let path2 = td.path().join("tmpfile2");
     t!(File::create(&path1));
     t!(File::create(&path2));
-    t!(ar.append_file("tmpfile1", &mut t!(File::open(&path1))));
+    t!(ar.append(t!(FsEntry::from_fs(path1, false)).set_path("tmpfile1".into())));
     let mut data = t!(ar.into_inner());
     let amt = data.len();
     data.truncate(amt - 512);
     let mut ar = Builder::new(data);
-    t!(ar.append_file("tmpfile2", &mut t!(File::open(&path2))));
+    t!(ar.append(t!(FsEntry::from_fs(path2, false)).set_path("tmpfile2".into())));
     t!(ar.finish());
 
     let data = t!(ar.into_inner());
@@ -646,32 +652,11 @@ fn file_times() {
 }
 
 #[test]
-fn zero_file_times() {
-    let td = t!(TempBuilder::new().prefix("tar-rs").tempdir());
-
-    let mut ar = Builder::new(Vec::new());
-    ar.mode(HeaderMode::Deterministic);
-    let path = td.path().join("tmpfile");
-    t!(File::create(&path));
-    t!(ar.append_path_with_name(&path, "a"));
-
-    let data = t!(ar.into_inner());
-    let mut ar = Archive::new(&data[..]);
-    assert!(ar.unpack(td.path()).is_ok());
-
-    let meta = fs::metadata(td.path().join("a")).unwrap();
-    let mtime = FileTime::from_last_modification_time(&meta);
-    let atime = FileTime::from_last_access_time(&meta);
-    assert!(mtime.unix_seconds() != 0);
-    assert!(atime.unix_seconds() != 0);
-}
-
-#[test]
 fn backslash_treated_well() {
     // Insert a file into an archive with a backslash
     let td = t!(TempBuilder::new().prefix("tar-rs").tempdir());
     let mut ar = Builder::new(Vec::<u8>::new());
-    t!(ar.append_dir("foo\\bar", td.path()));
+    t!(ar.append(t!(FsEntry::from_fs(td.path().into(), false)).set_path("foo\\bar".into())));
     let mut ar = Archive::new(Cursor::new(t!(ar.into_inner())));
     let f = t!(t!(ar.entries()).next().unwrap());
     if cfg!(unix) {
@@ -689,7 +674,8 @@ fn backslash_treated_well() {
         *a = *b;
     }
     header.set_cksum();
-    t!(ar.append(&header, &mut io::empty()));
+    t!(ar.append_header(&header));
+    t!(ar.append_content(&mut io::empty()));
     let data = t!(ar.into_inner());
     let mut ar = Archive::new(&data[..]);
     let f = t!(t!(ar.entries()).next().unwrap());
@@ -709,7 +695,9 @@ fn nul_bytes_in_path() {
     let nul_path = OsStr::from_bytes(b"foo\0");
     let td = t!(TempBuilder::new().prefix("tar-rs").tempdir());
     let mut ar = Builder::new(Vec::<u8>::new());
-    let err = ar.append_dir(nul_path, td.path()).unwrap_err();
+    let err = ar
+        .append(t!(FsEntry::from_fs(td.path().into(), false)).set_path(nul_path.into()))
+        .unwrap_err();
     assert!(err.to_string().contains("contains a nul byte"));
 }
 
@@ -816,14 +804,16 @@ fn long_name_trailing_nul() {
     h.set_size(4);
     h.set_entry_type(EntryType::new(b'L'));
     h.set_cksum();
-    t!(b.append(&h, "foo\0".as_bytes()));
+    t!(b.append_header(&h));
+    t!(b.append_content("foo\0".as_bytes()));
     let mut h = Header::new_gnu();
 
     t!(h.set_path("bar"));
     h.set_size(6);
     h.set_entry_type(EntryType::file());
     h.set_cksum();
-    t!(b.append(&h, "foobar".as_bytes()));
+    t!(b.append_header(&h));
+    t!(b.append_content("foobar".as_bytes()));
 
     let contents = t!(b.into_inner());
     let mut a = Archive::new(&contents[..]);
@@ -841,14 +831,16 @@ fn long_linkname_trailing_nul() {
     h.set_size(4);
     h.set_entry_type(EntryType::new(b'K'));
     h.set_cksum();
-    t!(b.append(&h, "foo\0".as_bytes()));
+    t!(b.append_header(&h));
+    t!(b.append_content("foo\0".as_bytes()));
     let mut h = Header::new_gnu();
 
     t!(h.set_path("bar"));
     h.set_size(6);
     h.set_entry_type(EntryType::file());
     h.set_cksum();
-    t!(b.append(&h, "foobar".as_bytes()));
+    t!(b.append_header(&h));
+    t!(b.append_content("foobar".as_bytes()));
 
     let contents = t!(b.into_inner());
     let mut a = Archive::new(&contents[..]);
@@ -866,7 +858,7 @@ fn encoded_long_name_has_trailing_nul() {
     let mut b = Builder::new(Vec::<u8>::new());
     let long = repeat("abcd").take(200).collect::<String>();
 
-    t!(b.append_file(&long, &mut t!(File::open(&path))));
+    t!(b.append(t!(FsEntry::from_fs(path, false)).set_path(long.into())));
 
     let contents = t!(b.into_inner());
     let mut a = Archive::new(&contents[..]);
@@ -1009,8 +1001,8 @@ fn path_separators() {
 
     // Make sure GNU headers normalize to Unix path separators,
     // including the `@LongLink` fallback used by `append_file`.
-    t!(ar.append_file(&short_path, &mut t!(File::open(&path))));
-    t!(ar.append_file(&long_path, &mut t!(File::open(&path))));
+    t!(ar.append(t!(FsEntry::from_fs(path.clone(), false)).set_path(short_path.clone().into())));
+    t!(ar.append(t!(FsEntry::from_fs(path, false)).set_path(long_path.clone().into())));
 
     let rd = Cursor::new(t!(ar.into_inner()));
     let mut ar = Archive::new(rd);
@@ -1043,13 +1035,13 @@ fn append_path_symlink() {
     t!(env::set_current_dir(td.path()));
     // "short" path name / short link name
     t!(symlink("testdest", "test"));
-    t!(ar.append_path("test"));
+    t!(ar.append(t!(FsEntry::from_fs("test".into(), false))));
     // short path name / long link name
     t!(symlink(&long_linkname, "test2"));
-    t!(ar.append_path("test2"));
+    t!(ar.append(t!(FsEntry::from_fs("test2".into(), false))));
     // long path name / long link name
     t!(symlink(&long_linkname, &long_pathname));
-    t!(ar.append_path(&long_pathname));
+    t!(ar.append(t!(FsEntry::from_fs(long_pathname.clone().into(), false))));
 
     let rd = Cursor::new(t!(ar.into_inner()));
     let mut ar = Archive::new(rd);
@@ -1093,14 +1085,15 @@ fn name_with_slash_doesnt_fool_long_link_and_bsd_compat() {
     h.set_size(4);
     h.set_entry_type(EntryType::new(b'L'));
     h.set_cksum();
-    t!(ar.append(&h, "foo\0".as_bytes()));
+    t!(ar.append_header(&h));
+    t!(ar.append_content("foo\0".as_bytes()));
 
     let mut header = Header::new_gnu();
     header.set_entry_type(EntryType::Regular);
     t!(header.set_path("testdir/"));
     header.set_size(0);
     header.set_cksum();
-    t!(ar.append(&header, &mut io::empty()));
+    t!(ar.append_header(&header));
 
     // Extracting
     let rdr = Cursor::new(t!(ar.into_inner()));
@@ -1121,10 +1114,20 @@ fn insert_local_file_different_name() {
     let td = t!(TempBuilder::new().prefix("tar-rs").tempdir());
     let path = td.path().join("directory");
     t!(fs::create_dir(&path));
-    ar.append_path_with_name(&path, "archive/dir").unwrap();
+    ar.append(
+        FsEntry::from_fs(path, false)
+            .unwrap()
+            .set_path("archive/dir".into()),
+    )
+    .unwrap();
     let path = td.path().join("file");
     t!(t!(File::create(&path)).write_all(b"test"));
-    ar.append_path_with_name(&path, "archive/dir/f").unwrap();
+    ar.append(
+        FsEntry::from_fs(path, false)
+            .unwrap()
+            .set_path("archive/dir/f".into()),
+    )
+    .unwrap();
 
     let rd = Cursor::new(t!(ar.into_inner()));
     let mut ar = Archive::new(rd);
@@ -1182,7 +1185,12 @@ fn append_long_multibyte() {
     for _ in 0..512 {
         name.push('a');
         name.push('𑢮');
-        x.append_data(&mut Header::new_gnu(), &name, data).unwrap();
+
+        let mut header = Header::new_gnu();
+        x.append_longpath(&name, &mut header).unwrap();
+        x.append_header(&header).unwrap();
+        x.append_content(data).unwrap();
+
         name.pop();
     }
 }
@@ -1199,14 +1207,16 @@ fn read_only_directory_containing_files() {
     h.set_entry_type(EntryType::dir());
     h.set_mode(0o444);
     h.set_cksum();
-    t!(b.append(&h, "".as_bytes()));
+    t!(b.append_header(&h));
+    t!(b.append_content("".as_bytes()));
 
     let mut h = Header::new_gnu();
     t!(h.set_path("dir/file"));
     h.set_size(2);
     h.set_entry_type(EntryType::file());
     h.set_cksum();
-    t!(b.append(&h, "hi".as_bytes()));
+    t!(b.append_header(&h));
+    t!(b.append_content("hi".as_bytes()));
 
     let contents = t!(b.into_inner());
     let mut ar = Archive::new(&contents[..]);
@@ -1235,13 +1245,13 @@ fn tar_directory_containing_special_files() {
     t!(env::set_current_dir(td.path()));
     let mut ar = Builder::new(Vec::new());
     // append_path has a different logic for processing files, so we need to test it as well
-    t!(ar.append_path("fifo"));
+    t!(ar.append(t!(FsEntry::from_fs("fifo".into(), false))));
     t!(ar.append_dir_all("special", td.path()));
     // unfortunately, block device file cannot be created by non-root users
     // as a substitute, just test the file that exists on most Unix systems
     t!(env::set_current_dir("/dev/"));
-    t!(ar.append_path("loop0"));
+    t!(ar.append(t!(FsEntry::from_fs("loop0".into(), false))));
     // CI systems seem to have issues with creating a chr device
-    t!(ar.append_path("null"));
+    t!(ar.append(t!(FsEntry::from_fs("null".into(), false))));
     t!(ar.finish());
 }

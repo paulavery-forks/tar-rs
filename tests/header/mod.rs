@@ -5,7 +5,7 @@ use std::{iter, mem, thread, time};
 
 use tempfile::Builder;
 
-use tar::{GnuHeader, Header, HeaderMode};
+use tar::{GnuHeader, Header};
 
 #[test]
 fn default_gnu() {
@@ -174,40 +174,6 @@ fn set_ustar_path_hard() {
     let p = Path::new("a").join(&vec!["a"; 100].join(""));
     t!(h.set_path(&p));
     assert_eq!(t!(h.path()), p);
-}
-
-#[test]
-fn set_metadata_deterministic() {
-    let td = t!(Builder::new().prefix("tar-rs").tempdir());
-    let tmppath = td.path().join("tmpfile");
-
-    fn mk_header(path: &Path, readonly: bool) -> Result<Header, io::Error> {
-        let mut file = t!(File::create(path));
-        t!(file.write_all(b"c"));
-        let mut perms = t!(file.metadata()).permissions();
-        perms.set_readonly(readonly);
-        t!(fs::set_permissions(path, perms));
-        let mut h = Header::new_ustar();
-        h.set_metadata_in_mode(&t!(path.metadata()), HeaderMode::Deterministic);
-        Ok(h)
-    }
-
-    // Create "the same" File twice in a row, one second apart, with differing readonly values.
-    let one = t!(mk_header(tmppath.as_path(), false));
-    thread::sleep(time::Duration::from_millis(1050));
-    let two = t!(mk_header(tmppath.as_path(), true));
-
-    // Always expected to match.
-    assert_eq!(t!(one.size()), t!(two.size()));
-    assert_eq!(t!(one.path()), t!(two.path()));
-    assert_eq!(t!(one.mode()), t!(two.mode()));
-
-    // Would not match without `Deterministic`.
-    assert_eq!(t!(one.mtime()), t!(two.mtime()));
-    // TODO: No great way to validate that these would not be filled, but
-    // check them anyway.
-    assert_eq!(t!(one.uid()), t!(two.uid()));
-    assert_eq!(t!(one.gid()), t!(two.gid()));
 }
 
 #[test]
